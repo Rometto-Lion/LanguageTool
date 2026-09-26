@@ -1,14 +1,17 @@
 {
   "manifest_version": 3,
   "name": "Rometto LanguageTool",
-  "version": "1.4",
-  "description": "Умная проверка орфографии и пунктуации с LanguageTool и Яндекс.Спеллер",
+  "version": "1.5",
+  "description": "Умная проверка орфографии и пунктуации (LanguageTool + Яндекс.Спеллер)",
   "permissions": ["activeTab"],
   "host_permissions": [
     "<all_urls>",
     "https://api.languagetool.org/*",
     "https://speller.yandex.net/*"
   ],
+  "background": {
+    "service_worker": "background.js"
+  },
   "icons": {
     "16": "Rometto_icon.png",
     "32": "Rometto_icon.png",
