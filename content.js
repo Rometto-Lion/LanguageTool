@@ -6,10 +6,24 @@
   let currentRequestId = 0;
   let isInteractingWithPopup = false;
 
-  const LT_API_URL = 'https://api.languagetool.org/v2/check';
-  const YANDEX_API_URL = 'https://speller.yandex.net/services/spellservice.json/checkText';
-  const API_TIMEOUT_MS = 6000;
+  // Кэш последнего проверенного текста для конкретного элемента —
+  // не бьём по API повторно, если текст не изменился (например,
+  // пользователь просто кликнул обратно в то же поле).
+  let lastCheckedElement = null;
+  let lastCheckedText = null;
 
+  // --- Эвристика "это не то поле, которое нужно проверять" -------------
+  // Раньше расширение проверяло ЛЮБОЕ текстовое поле на ЛЮБОМ сайте,
+  // включая поля поиска, email, телефон, URL, купоны и т.п. Из-за этого
+  // бейдж/подсветка вылезали там, где орфография не имеет смысла —
+  // в поисковых строках, полях с номерами, промокодами и т.д.
+  const NON_PROSE_NAME_REGEX =
+    /search|query|\bq\b|url|link|phone|tel|otp|code|captcha|token|zip|postal|username|login|password|e-?mail|coupon|promo|price|amount|quantity|\bqty\b|card|cvv|pin|api[-_]?key/i;
+
+  const MIN_TARGET_WIDTH = 60;
+  const MIN_TARGET_HEIGHT = 16;
+
+  // Создаем изолированный контейнер Shadow DOM
   const host = document.createElement('div');
   host.id = 'lt-clone-root';
   document.documentElement.appendChild(host);
@@ -135,6 +149,33 @@
     .lt-panel-item:last-child {
       border-bottom: none;
     }
+    .lt-fix-all-btn {
+      background: #3f3f46;
+      color: #fafafa;
+      border: 1px solid #52525b;
+      border-radius: 6px;
+      padding: 8px 12px;
+      width: 100%;
+      text-align: center;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      margin-bottom: 10px;
+      transition: background 0.15s ease;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 3px;
+    }
+    .lt-fix-all-btn:hover {
+      background: #52525b;
+    }
+    .lt-fix-all-btn .warning {
+      font-size: 10px;
+      color: #fbbf24;
+      font-weight: 400;
+      line-height: 1.2;
+    }
   `;
   shadow.appendChild(style);
 
@@ -160,11 +201,20 @@
     el.addEventListener('mouseup', () => { setTimeout(() => { isInteractingWithPopup = false; }, 100); });
   });
 
+  function handleElementScroll() {
+    if (activeElement && isValidTarget(activeElement)) {
+      syncOverlayPosition(activeElement);
+    }
+  }
+
   function clearAllState() {
     currentRequestId++;
     if (debounceTimer) {
       clearTimeout(debounceTimer);
       debounceTimer = null;
+    }
+    if (activeElement) {
+      activeElement.removeEventListener('scroll', handleElementScroll);
     }
     overlay.innerHTML = '';
     badge.style.display = 'none';
@@ -174,6 +224,8 @@
     panel.style.display = 'none';
     currentErrors = [];
     currentText = '';
+    lastCheckedElement = null;
+    lastCheckedText = null;
   }
 
   function getCleanText(el) {
@@ -187,16 +239,56 @@
     return val;
   }
 
+  // Собирает подсказки о том, что это НЕ поле для прозы: имя/id/placeholder/
+  // aria-label совпадают с типичными служебными полями (поиск, телефон,
+  // купон и т.д.), либо у поля явно слишком маленький размер (иконка поиска
+  // в шапке сайта, а не поле для текста).
+  function looksLikeNonProseField(el) {
+    const hints = [
+      el.name, el.id, el.placeholder,
+      el.getAttribute && el.getAttribute('aria-label'),
+      el.getAttribute && el.getAttribute('autocomplete'),
+      el.getAttribute && el.getAttribute('role')
+    ].filter(Boolean).join(' ');
+
+    if (NON_PROSE_NAME_REGEX.test(hints)) return true;
+
+    if (el.getAttribute && (el.getAttribute('role') === 'searchbox' || el.getAttribute('role') === 'combobox')) {
+      return true;
+    }
+
+    return false;
+  }
+
   function isValidTarget(el) {
     if (!el || el.disabled || el.readOnly) return false;
-    if (el.isContentEditable) return true;
-    if (el.tagName === 'TEXTAREA') return true;
-    if (el.tagName === 'INPUT') {
+    if (!document.contains(el)) return false;
+
+    let isSupportedType = false;
+
+    if (el.isContentEditable) {
+      isSupportedType = true;
+    } else if (el.tagName === 'TEXTAREA') {
+      isSupportedType = true;
+    } else if (el.tagName === 'INPUT') {
+      // Раньше сюда попадали также email/url/tel/search — это НЕ свободный
+      // текст, проверять там орфографию/грамматику не нужно и вводит в
+      // заблуждение (плюс лишние запросы к публичному API).
       const type = (el.type || 'text').toLowerCase();
-      const textInputTypes = ['text', 'search', 'email', 'url', 'tel', ''];
-      return textInputTypes.includes(type);
+      isSupportedType = type === 'text' || type === '';
     }
-    return false;
+
+    if (!isSupportedType) return false;
+    if (looksLikeNonProseField(el)) return false;
+
+    // Пропускаем совсем маленькие поля — как правило, это иконки-кнопки
+    // поиска в шапке сайта, а не место для текста. Именно из-за таких
+    // полей бейдж/подсветка визуально "наезжали" на соседние элементы
+    // (например, на фото/логотип рядом с компактным полем поиска).
+    const rect = el.getBoundingClientRect();
+    if (rect.width < MIN_TARGET_WIDTH || rect.height < MIN_TARGET_HEIGHT) return false;
+
+    return true;
   }
 
   function syncOverlayPosition(el) {
@@ -221,28 +313,75 @@
     overlay.style.textTransform = computed.textTransform;
     overlay.style.whiteSpace = computed.whiteSpace === 'normal' ? 'pre-wrap' : computed.whiteSpace;
     overlay.style.wordBreak = computed.wordBreak;
+    overlay.style.direction = computed.direction;
 
     overlay.style.paddingTop = computed.paddingTop;
     overlay.style.paddingRight = computed.paddingRight;
     overlay.style.paddingBottom = computed.paddingBottom;
     overlay.style.paddingLeft = computed.paddingLeft;
+    // Копируем рамки, чтобы текст совпадал пиксель в пиксель
     overlay.style.borderTopWidth = computed.borderTopWidth;
     overlay.style.borderLeftWidth = computed.borderLeftWidth;
     overlay.style.borderRightWidth = computed.borderRightWidth;
     overlay.style.borderBottomWidth = computed.borderBottomWidth;
+    overlay.style.borderStyle = 'solid';
+    overlay.style.borderColor = 'transparent';
     overlay.style.boxSizing = computed.boxSizing;
 
     overlay.scrollTop = el.scrollTop;
     overlay.scrollLeft = el.scrollLeft;
 
-    badge.style.top = `${rect.bottom + window.scrollY - 28}px`;
-    badge.style.left = `${rect.right + window.scrollX - 28}px`;
+    // Изменяем позицию бейджа: правый верхний угол (чтобы не перекрывать иконки внутри инпутов справа)
+    badge.style.top = `${rect.top + window.scrollY - 10}px`;
+    badge.style.left = `${rect.right + window.scrollX - 10}px`;
     badge.style.display = 'flex';
   }
 
   function hidePopups() {
     tooltip.style.display = 'none';
     panel.style.display = 'none';
+  }
+
+  function applyAllFixes() {
+    if (!activeElement || !currentText) return;
+
+    const fixableErrors = currentErrors
+      .filter(err => err.replacements && err.replacements.length > 0)
+      .sort((a, b) => b.offset - a.offset); // Идем с конца, чтобы оффсеты не съезжали
+
+    if (fixableErrors.length === 0) return;
+
+    let newText = currentText;
+    for (const err of fixableErrors) {
+      const rep = err.replacements[0];
+      newText = newText.slice(0, err.offset) + rep + newText.slice(err.offset + err.length);
+    }
+
+    activeElement.focus();
+    if ('setSelectionRange' in activeElement && typeof activeElement.selectionStart === 'number') {
+      activeElement.setSelectionRange(0, activeElement.value.length);
+      const success = document.execCommand('insertText', false, newText);
+      if (!success) {
+        activeElement.value = newText;
+        activeElement.dispatchEvent(new Event('input', { bubbles: true }));
+      }
+    } else if (activeElement.isContentEditable) {
+      const range = document.createRange();
+      range.selectNodeContents(activeElement);
+      const sel = window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(range);
+
+      const success = document.execCommand('insertText', false, newText);
+      if (!success) {
+        activeElement.innerText = newText;
+        activeElement.dispatchEvent(new Event('input', { bubbles: true }));
+      }
+    }
+
+    hidePopups();
+    lastCheckedText = null; // сбрасываем кэш, чтобы форсировать новую проверку
+    runCheck(activeElement);
   }
 
   function getTextNodesUnder(el) {
@@ -290,8 +429,10 @@
     activeElement.focus();
 
     if ('setSelectionRange' in activeElement && typeof activeElement.selectionStart === 'number') {
+      // Обычные поля ввода (textarea, input)
       activeElement.setSelectionRange(offset, offset + length);
       const success = document.execCommand('insertText', false, newText);
+
       const newCursorPos = offset + newText.length;
       if (!success) {
         const full = activeElement.value || '';
@@ -300,6 +441,7 @@
       }
       activeElement.setSelectionRange(newCursorPos, newCursorPos);
     } else if (activeElement.isContentEditable) {
+      // Редакторы сообщений в мессенджерах (contenteditable)
       const range = setContentEditableRange(activeElement, offset, offset + length);
       let replaced = false;
 
@@ -313,6 +455,7 @@
           const newNode = document.createTextNode(newText);
           range.insertNode(newNode);
 
+          // Ставим курсор сразу после вставленного текста
           const sel = window.getSelection();
           const newRange = document.createRange();
           newRange.setStartAfter(newNode);
@@ -327,7 +470,8 @@
       }
     }
 
-    tooltip.style.display = 'none';
+    hidePopups();
+    lastCheckedText = null; // текст изменился — форсируем повторную проверку
     runCheck(activeElement);
   }
 
@@ -392,6 +536,22 @@
     if (!currentErrors.length) {
       panel.innerHTML += `<div style="color:#4ade80;font-size:12px;">Ошибок не обнаружено ✓</div>`;
     } else {
+      const fixableCount = currentErrors.filter(e => e.replacements && e.replacements.length > 0).length;
+      if (fixableCount > 0) {
+        const fixAllBtn = document.createElement('button');
+        fixAllBtn.className = 'lt-fix-all-btn';
+        fixAllBtn.innerHTML = `
+          <span>Исправить всё (${fixableCount})</span>
+          <span class="warning">⚠️ Внимание: обязательно проверьте текст после автозамены!</span>
+        `;
+        fixAllBtn.onmousedown = (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          applyAllFixes();
+        };
+        panel.appendChild(fixAllBtn);
+      }
+
       currentErrors.forEach((err) => {
         const item = document.createElement('div');
         item.className = 'lt-panel-item';
@@ -452,25 +612,19 @@
       overlay.innerHTML = '';
       badge.textContent = '✓';
       badge.classList.remove('has-errors');
-      if (panel.style.display === 'block') {
-        showAllErrorsPanel(badge.getBoundingClientRect());
-      }
+      hidePopups();
       return;
     }
 
     badge.textContent = errors.length;
     badge.classList.add('has-errors');
 
-    if (panel.style.display === 'block') {
-      showAllErrorsPanel(badge.getBoundingClientRect());
-    }
-
     let html = '';
     let lastIdx = 0;
 
     errors.sort((a, b) => a.offset - b.offset).forEach((err, index) => {
       html += escapeHtml(text.slice(lastIdx, err.offset));
-      
+
       let word = text.slice(err.offset, err.offset + err.length);
       if (!word) word = ' ';
 
@@ -486,13 +640,17 @@
   function getCaretOffset(target, clickX, clickY) {
     if (!target) return -1;
     if (target.isContentEditable) {
-      let range;
+      let range = null;
       if (document.caretRangeFromPoint) {
         range = document.caretRangeFromPoint(clickX, clickY);
       } else if (document.caretPositionFromPoint) {
         const pos = document.caretPositionFromPoint(clickX, clickY);
-        range = document.createRange();
-        range.setStart(pos.offsetNode, pos.offset);
+        // pos может быть null (например, клик пришёлся на картинку/пустую
+        // область внутри contenteditable) — раньше это падало с TypeError.
+        if (pos && pos.offsetNode) {
+          range = document.createRange();
+          range.setStart(pos.offsetNode, pos.offset);
+        }
       }
       if (range) {
         const preRange = document.createRange();
@@ -506,85 +664,22 @@
     return -1;
   }
 
-  async function fetchWithTiming(url, options, name) {
-    const start = performance.now();
-    try {
-      const res = await fetch(url, {
-        ...options,
-        signal: AbortSignal.timeout(API_TIMEOUT_MS)
-      });
-      const timeMs = Math.round(performance.now() - start);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = await res.json();
-      return { ok: true, data, timeMs, name };
-    } catch (e) {
-      const timeMs = Math.round(performance.now() - start);
-      return { ok: false, error: e, timeMs, name };
-    }
-  }
-
-  function normalizeLTMatches(data, text) {
-    const formatted = [];
-    (data.matches || []).forEach(m => {
-      const isHugeStylisticRule = (!m.replacements || m.replacements.length === 0) && m.length > 25;
-      if (isHugeStylisticRule) return;
-
-      let replacements = (m.replacements || []).map(r => r.value);
-      const snippet = text.slice(m.offset, m.offset + m.length);
-
-      if (replacements.length === 0 && /[а-яё]\s+[А-ЯЁ]/.test(snippet)) {
-        const parts = snippet.split(/\s+/);
-        if (parts.length >= 2) {
-          replacements = [
-            `${parts[0]}. ${parts[1]}`,
-            `${parts[0]}, ${parts[1].toLowerCase()}`
-          ];
+  // Отправляет текст в background.js, который параллельно опрашивает
+  // LanguageTool и Яндекс.Спеллер и возвращает уже объединённый список ошибок.
+  function checkWithEngines(text, langCode, requestId) {
+    return new Promise((resolve) => {
+      chrome.runtime.sendMessage(
+        { type: 'rometto-check', text, langCode, requestId },
+        (response) => {
+          if (chrome.runtime.lastError) {
+            console.warn('[Rometto LT] Не удалось связаться с background.js:', chrome.runtime.lastError.message);
+            resolve({ requestId, ok: false, errors: [] });
+            return;
+          }
+          resolve(response || { requestId, ok: false, errors: [] });
         }
-      } else if (replacements.length === 0 && /^[А-ЯЁ][а-яё]+$/.test(snippet)) {
-        replacements = [`. ${snippet}`, snippet.toLowerCase()];
-      }
-
-      formatted.push({
-        offset: m.offset,
-        length: m.length,
-        message: m.message,
-        replacements: replacements,
-        type: m.rule?.issueType === 'misspelling' ? 'spelling' : 'grammar',
-        source: 'LanguageTool'
-      });
+      );
     });
-    return formatted;
-  }
-
-  function normalizeYandexMatches(data) {
-    if (!Array.isArray(data)) return [];
-    return data.map(m => ({
-      offset: m.pos,
-      length: m.len,
-      message: 'Возможна орфографическая ошибка (Яндекс)',
-      replacements: m.s || [],
-      type: 'spelling',
-      source: 'Yandex'
-    }));
-  }
-
-  function mergeEngineErrors(ltErrors, yandexErrors) {
-    const merged = [...ltErrors];
-    for (const ye of yandexErrors) {
-      const match = merged.find(le => {
-        const aStart = le.offset, aEnd = le.offset + le.length;
-        const bStart = ye.offset, bEnd = ye.offset + ye.length;
-        return aStart < bEnd && bStart < aEnd;
-      });
-
-      if (!match) {
-        merged.push(ye);
-      } else {
-        const combined = [...(match.replacements || []), ...(ye.replacements || [])];
-        match.replacements = [...new Set(combined)].slice(0, 6);
-      }
-    }
-    return merged;
   }
 
   async function runCheck(target) {
@@ -595,61 +690,57 @@
       return;
     }
 
+    // Оптимизация: не бьём по API повторно, если текст в этом же элементе
+    // не изменился с прошлой проверки (например, просто вернулись фокусом).
+    if (target === lastCheckedElement && text === lastCheckedText) {
+      return;
+    }
+
     const requestId = ++currentRequestId;
     syncOverlayPosition(target);
 
     const isRussian = /[а-яёА-ЯЁ]/.test(text);
     const langCode = isRussian ? 'ru-RU' : 'en-US';
 
-    const ltParams = new URLSearchParams();
-    ltParams.append('text', text);
-    ltParams.append('language', langCode);
-    ltParams.append('level', 'picky');
-    ltParams.append('enabledCategories', 'PUNCTUATION,TYPOGRAPHY,GRAMMAR,MISC');
+    const result = await checkWithEngines(text, langCode, requestId);
+    if (requestId !== currentRequestId) return; // пришёл ответ на устаревший запрос
 
-    const yandexParams = new URLSearchParams();
-    yandexParams.append('text', text);
-    yandexParams.append('lang', isRussian ? 'ru' : 'en');
-    yandexParams.append('options', '0');
-    yandexParams.append('format', 'plain');
-
-    const totalStart = performance.now();
-
-    const [ltRes, yandexRes] = await Promise.allSettled([
-      fetchWithTiming(LT_API_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: ltParams
-      }, 'LanguageTool'),
-
-      fetchWithTiming(YANDEX_API_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: yandexParams
-      }, 'Yandex Speller')
-    ]);
-
-    if (requestId !== currentRequestId) return;
     const currentVal = getCleanText(target);
     if (currentVal.trim().length < 2) {
       clearAllState();
       return;
     }
+    if (currentVal !== text) return; // текст успел измениться, ждём следующего debounce
 
-    const ltData = ltRes.status === 'fulfilled' ? ltRes.value : { ok: false, timeMs: 0 };
-    const yandexData = yandexRes.status === 'fulfilled' ? yandexRes.value : { ok: false, timeMs: 0 };
-    const totalTimeMs = Math.round(performance.now() - totalStart);
+    if (!result || !result.ok) {
+      console.warn('[Rometto LT] Оба сервиса недоступны, проверка пропущена');
+      return;
+    }
 
-    console.log(
-      `⏱ [Rometto LT] ИТОГО: ${totalTimeMs} ms | ` +
-      `LanguageTool: ${ltData.timeMs} ms (${ltData.ok ? 'OK' : 'ERR'}) | ` +
-      `Yandex Speller: ${yandexData.timeMs} ms (${yandexData.ok ? 'OK' : 'ERR'})`
-    );
+    lastCheckedElement = target;
+    lastCheckedText = text;
 
-    const ltErrors = ltData.ok ? normalizeLTMatches(ltData.data, text) : [];
-    const yErrors = yandexData.ok ? normalizeYandexMatches(yandexData.data) : [];
+    let formattedErrors = (result.errors || []).map(err => {
+      let replacements = err.replacements || [];
+      const snippet = text.slice(err.offset, err.offset + err.length);
 
-    let formattedErrors = mergeEngineErrors(ltErrors, yErrors);
+      if (replacements.length === 0 && /[а-яё]\s+[А-ЯЁ]/.test(snippet)) {
+        const parts = snippet.split(/\s+/);
+        if (parts.length >= 2) {
+          replacements = [
+            `${parts[0]}. ${parts[1]}`,
+            `${parts[0]}, ${parts[1].toLowerCase()}`
+          ];
+        }
+      } else if (replacements.length === 0 && /^[А-ЯЁ][а-яё]+$/.test(snippet)) {
+        replacements = [
+          `. ${snippet}`,
+          snippet.toLowerCase()
+        ];
+      }
+
+      return { ...err, replacements };
+    });
 
     // Детектор обращений (Имя + приветствие)
     if (isRussian) {
@@ -674,8 +765,7 @@
               `${name}, здравствуй`,
               `${name}, добрый день`
             ],
-            type: 'grammar',
-            source: 'Rometto Detector'
+            type: 'grammar'
           });
         }
       }
@@ -687,22 +777,18 @@
   function handleInputEvent(e) {
     if (!isValidTarget(e.target)) return;
     const text = getCleanText(e.target);
+    syncOverlayPosition(e.target); // Сразу синхронизируем скролл и размер, чтобы подсветка не съезжала при наборе
     if (text.trim().length < 2) {
       clearAllState();
       return;
     }
     activeElement = e.target;
     if (debounceTimer) clearTimeout(debounceTimer);
-    debounceTimer = setTimeout(() => runCheck(e.target), 350);
+    debounceTimer = setTimeout(() => runCheck(e.target), 450);
   }
 
   document.addEventListener('input', handleInputEvent);
   document.addEventListener('cut', (e) => setTimeout(() => handleInputEvent(e), 20));
-  document.addEventListener('keyup', (e) => {
-    if (['Backspace', 'Delete'].includes(e.key)) {
-      handleInputEvent(e);
-    }
-  });
 
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey && isValidTarget(e.target)) {
@@ -724,21 +810,48 @@
       clearAllState();
       return;
     }
+    
+    // Очищаем старый слушатель, если мы переключились между полями
+    if (activeElement) {
+      activeElement.removeEventListener('scroll', handleElementScroll);
+    }
+    
     activeElement = e.target;
+    // Подписываемся на внутренний скролл элемента
+    activeElement.addEventListener('scroll', handleElementScroll, { passive: true });
+
     const text = getCleanText(e.target);
     if (text.trim().length >= 2) {
       syncOverlayPosition(e.target);
-      runCheck(e.target);
+      // Debounce и здесь: раньше проверка запускалась мгновенно на КАЖДЫЙ
+      // фокус, включая переход по Tab между уже заполненными полями формы —
+      // это и создавало ощущение, что расширение "лезет" куда не просили.
+      if (debounceTimer) clearTimeout(debounceTimer);
+      debounceTimer = setTimeout(() => runCheck(e.target), 150);
     } else {
       clearAllState();
     }
   });
 
+  document.addEventListener('focusout', (e) => {
+    // Если элемент, за которым мы следили, исчез из DOM (например, SPA
+    // заменила разметку компоузера), явно прячем оверлей/бейдж, а не
+    // оставляем их "висеть" поверх остального контента страницы.
+    setTimeout(() => {
+      if (activeElement && !document.contains(activeElement)) {
+        clearAllState();
+        activeElement = null;
+      }
+    }, 0);
+  });
+
+  // Клик по тексту определяет попадание в ошибку без блокировки курсора
   document.addEventListener('click', (e) => {
     if (isInteractingWithPopup) return;
 
     if (e.target !== host && !host.contains(e.target)) {
       if (isValidTarget(e.target) && currentErrors.length > 0) {
+        // Небольшая задержка, чтобы браузер успел поставить нативный курсор
         setTimeout(() => {
           const offset = getCaretOffset(e.target, e.clientX, e.clientY);
           if (offset >= 0) {
@@ -757,7 +870,14 @@
   });
 
   window.addEventListener('scroll', () => {
-    if (activeElement && isValidTarget(activeElement)) syncOverlayPosition(activeElement);
+    if (activeElement) {
+      if (!document.contains(activeElement)) {
+        clearAllState();
+        activeElement = null;
+        return;
+      }
+      if (isValidTarget(activeElement)) syncOverlayPosition(activeElement);
+    }
   }, true);
 
   window.addEventListener('resize', () => {
@@ -772,4 +892,17 @@
       if (activeElement && isValidTarget(activeElement)) syncOverlayPosition(activeElement);
     });
   }
+
+  // Если элемент, за которым следим, удаляется из DOM (частая ситуация в
+  // SPA — React/Vue пересобирают форму), сразу же прячем оверлей/бейдж,
+  // а не оставляем их зависшими поверх новой разметки (в том числе поверх
+  // соседних картинок/фото, если бейдж оказался там же по координатам).
+  const cleanupObserver = new MutationObserver(() => {
+    if (activeElement && !document.contains(activeElement)) {
+      clearAllState();
+      activeElement = null;
+    }
+  });
+  cleanupObserver.observe(document.documentElement, { childList: true, subtree: true });
+  // --- я устал... 
 })();
